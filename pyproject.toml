@@ -1,0 +1,22 @@
+[project]
+name = "okore-agent"
+version = "0.1.0"
+description = "Agente de expedientes con tools, confirmación humana y trazabilidad (prueba técnica OKORE)"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pydantic",
+    "psycopg[binary]",
+    "langgraph",
+    "langchain-openai",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
