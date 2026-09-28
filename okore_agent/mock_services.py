@@ -166,7 +166,8 @@ def get_claim(claim_id: str):
 
 @app.get("/api/workshops/{workshop_id}")
 async def get_workshop(workshop_id: str):
-    # Case 3 fault injection, read per request so it can be toggled without restarting.
+    # Case 3 fault injection. Read per request so tests can monkeypatch it; in Docker, recreate the container:
+    # FAULT_WORKSHOPS=500 docker compose up -d mocks
     fault = os.environ.get("FAULT_WORKSHOPS", "")
     if fault == "500":
         raise HTTPException(500, "workshops service error")
