@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[binary]",
     "langgraph",
     "langchain-openai",
+    "typesafe-sdk>=0.7.2",
 ]
 
 [dependency-groups]
