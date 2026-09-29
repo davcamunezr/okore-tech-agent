@@ -122,6 +122,7 @@ def test_llm_down_is_a_controlled_answer(backend, trace_file):
     ask, _ = agent(llm=Down())
     reply = ask("luis", "¿Estado de EXP-10234?")
     assert reply.decision == "llm_unavailable" and backend == []
+    assert "model server unreachable" in reply.answer
     assert lines(trace_file)[0]["errors"][0] == {
         "tool": "llm", "code": "UPSTREAM_ERROR", "message": "ConnectError: model server unreachable", "retryable": True}
 

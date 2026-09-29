@@ -141,7 +141,11 @@ _BULK = re.compile(
 )
 _REQUEST = re.compile(r"solicit|recl[aá]m|\bpide\b|p[ií]de(le|selo)|\bpedir\b|env[ií]a|\bmanda", re.I)
 _CLAIM = re.compile(r"EXP-\d{5}|expediente", re.I)
-_CLAIMS_DONE = re.compile(r"\b(he|hemos) (solicitado|enviado|pedido|ejecutado)|ya se ha (enviado|solicitado)", re.I)
+_CLAIMS_DONE = re.compile(
+    r"\b(he|hemos) (solicitado|enviado|pedido|ejecutado|realizado)"
+    r"|\bse ha (enviado|solicitado|realizado|ejecutado|tramitado)",
+    re.I,
+)
 
 
 class RulesJudge:

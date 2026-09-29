@@ -55,7 +55,9 @@ class ClaimInput(_Input):
 
 
 class WorkshopInput(_Input):
-    workshop_id: WorkshopId
+    workshop_id: WorkshopId = Field(
+        description="El workshop_id exacto que devolvió get_claim (formato T-123). No lo deduzcas ni lo inventes."
+    )
 
 
 class EventsInput(ClaimInput):
@@ -160,7 +162,9 @@ def _tool(input_model: type[_Input]):
             try:
                 args = input_model.model_validate(kwargs)
             except ValidationError as exc:
-                return _fail("INVALID_INPUT", _describe(exc))
+                # Worded for the caller (the LLM): the service was never called, the fix is on its side.
+                return _fail("INVALID_INPUT", f"Argumentos inválidos, no se ha llamado al servicio: {_describe(exc)}. "
+                                              "Corrígelos con valores reales obtenidos antes y vuelve a llamar.")
             if fn.__name__ not in allowed_tools(ctx.user):
                 return _fail("FORBIDDEN", f"El rol {ctx.user.role} no puede usar {fn.__name__}.")
             try:
@@ -184,7 +188,8 @@ def get_claim(ctx: ToolContext, args: ClaimInput) -> ClaimView:
 
 @_tool(WorkshopInput)
 def get_workshop(ctx: ToolContext, args: WorkshopInput) -> WorkshopView:
-    """Datos del taller: nombre, contacto, estado (ACTIVE/INACTIVE) y canales disponibles."""
+    """Datos del taller: nombre, contacto, estado (ACTIVE/INACTIVE) y canales disponibles.
+    Llámala después de get_claim, cuando ya tengas su workshop_id; no en la misma tanda."""
     return _fetch_workshop(ctx, args.workshop_id)
 
 

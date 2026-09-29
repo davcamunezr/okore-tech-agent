@@ -28,5 +28,32 @@ services:
       postgres:
         condition: service_healthy
 
+  # Interactive CLI, not a daemon: docker compose run --rm agent --user luis
+  agent:
+    build: .
+    profiles: ["cli"]
+    entrypoint: ["python", "-m", "okore_agent.cli"]
+    stdin_open: true
+    tty: true
+    environment:
+      MOCKS_URL: http://mocks:8001
+      AGENT_DB_URL: postgresql://agent_ro:agent_ro@postgres:5432/${POSTGRES_DB:-okore}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      # The model server runs on the host (e.g. Ollama on :11434), not in this compose.
+      LLM_BASE_URL: ${DOCKER_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:14b}
+      LLM_API_KEY: ${LLM_API_KEY:-not-needed}
+      TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
+      TRACE_PATH: /app/logs/agent_runs.jsonl
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mocks:
+        condition: service_started
+
 volumes:
   pgdata:
