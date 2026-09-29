@@ -183,9 +183,63 @@ def test_output_guardrail_withholds_flagged_answers(flags):
     assert state()["messages"][-1].content == reply.answer  # the LLM's text is replaced in the history too
 
 
-def test_rules_output_guard_catches_invented_execution():
-    assert RulesJudge().screen_output("Listo, he solicitado la foto al taller.").claims_done >= agent_graph.OUTPUT_BLOCK
+@pytest.mark.parametrize("text", [
+    "Listo, he solicitado la foto al taller.",
+    "La propuesta para solicitar la foto de matrícula al taller ya se ha realizado correctamente.",  # qwen2.5, live
+])
+def test_rules_output_guard_catches_invented_execution(text):
+    assert RulesJudge().screen_output(text).claims_done >= agent_graph.OUTPUT_BLOCK
+
+
+def test_rules_output_guard_lets_history_through():
     assert RulesJudge().screen_output("El 25/09 se solicitó PHOTO_PLATE.").claims_done == 0
+
+
+# --- Batched tool calls ---
+
+def test_guessed_argument_in_a_batch_never_reaches_the_backend(backend):
+    class Batching(ScriptedLLM):
+        """Like qwen2.5 via Ollama: fetches the claim and the workshop at once, guessing the workshop id."""
+
+        def _next(self, messages):
+            if not any(getattr(m, "tool_calls", None) for m in messages):
+                call = _call("get_claim", claim_id="EXP-10234")
+                call.tool_calls.append({"name": "get_workshop", "args": {"workshop_id": "<from get_claim>"},
+                                        "id": "call_guess"})
+                return call
+            # Reads the refusal and retries with the real id, as qwen2.5 did.
+            return super()._next([m for m in messages if getattr(m, "tool_call_id", None) != "call_guess"])
+
+    ask, _, state = agent(llm=Batching())
+    reply = ask("luis", "¿Cómo va EXP-10234?")
+    calls = state()["tool_calls"]
+    assert [c["name"] for c in calls] == ["get_claim", "get_workshop", "get_workshop"]
+    assert calls[0]["result"]["ok"] and calls[1]["result"]["error"]["code"] == "INVALID_INPUT"
+    assert calls[2]["args"] == {"workshop_id": "T-228"} and "Talleres Norte" in reply.answer
+
+
+def test_a_failed_call_is_not_repeated_in_the_same_turn(monkeypatch, backend):
+    monkeypatch.setenv("FAULT_WORKSHOPS", "500")
+    attempts = []
+    real = tools._request
+
+    def counting(ctx, method, path, *args, **kwargs):
+        attempts.append(path)
+        return real(ctx, method, path, *args, **kwargs)
+
+    monkeypatch.setattr(tools, "_request", counting)
+
+    class Insisting(ScriptedLLM):
+        def _next(self, messages):
+            done = sum(1 for m in messages if getattr(m, "name", None) == "get_workshop")
+            if done < 3:
+                return _call("get_workshop", workshop_id="T-228")
+            return super()._next(messages)
+
+    ask, _, state = agent(llm=Insisting())
+    ask("luis", "¿Cómo va EXP-10234?")
+    assert attempts.count("/api/workshops/T-228") == 1  # one tool run (2 HTTP attempts inside), then refusals
+    assert len(state()["errors"]) == 1 and "no insistas" in state()["tool_calls"][2]["result"]["error"]["message"]
 
 
 # --- Loop bound ---
@@ -196,7 +250,8 @@ def test_step_limit_stops_a_looping_llm(backend):
             return _call("get_claim", claim_id="EXP-10234")
 
     ask, _, state = agent(llm=Looping())
-    assert ask("luis", "¿Estado de EXP-10234?").decision == "step_limit"
+    reply = ask("luis", "¿Estado de EXP-10234?")
+    assert reply.decision == "step_limit" and "Último error" not in reply.answer  # nothing failed: nothing to add
     assert state()["steps"] == agent_graph.MAX_STEPS and backend == []
 
 

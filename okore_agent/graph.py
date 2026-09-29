@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Annotated, TypedDict
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -25,6 +25,7 @@ from langgraph.types import Command, interrupt
 
 from okore_agent import security, tools, trace
 from okore_agent.judge import Judge
+from okore_agent.llm import PROMPT_VERSION, SYSTEM_PROMPT
 from okore_agent.tools import DOCUMENT_LABELS, TOOLS, PendingAction, ToolContext
 
 MAX_STEPS = 6  # LLM calls per turn
@@ -60,6 +61,7 @@ class AgentState(TypedDict, total=False):
     suspicious: bool
     tools_enabled: list[str]
     llm_model: str
+    prompt_version: str
     tool_calls: list[dict]  # name, args, result, latency
     errors: list[dict]
     pending_action: dict | None
@@ -82,6 +84,7 @@ def build_graph(
             "tools_enabled": [], "tool_calls": [], "errors": [], "pending_action": None, "action_result": None,
             "final_decision": "", "answer": "", "steps": 0,
             "llm_model": getattr(llm, "model_name", None) or llm._llm_type,
+            "prompt_version": PROMPT_VERSION,
         }
         try:
             security.get_user(state["user_id"])
@@ -107,7 +110,8 @@ def build_graph(
         bound = llm.bind_tools([_tool_spec(name) for name in state["tools_enabled"]])
         steps = state["steps"] + 1
         try:
-            reply = bound.invoke(state["messages"])
+            # Prepended per call, not stored: the history keeps only what the user and the tools said.
+            reply = bound.invoke([SystemMessage(SYSTEM_PROMPT), *state["messages"]])
         except Exception as exc:  # external model boundary: down, timeout, malformed output. Nothing was done.
             return {"steps": steps, "final_decision": "llm_unavailable", "errors": state["errors"] + [{
                 "tool": "llm", "code": "UPSTREAM_ERROR", "message": f"{type(exc).__name__}: {exc}"[:300],
@@ -119,15 +123,22 @@ def build_graph(
     def run_tools(state: AgentState) -> dict:
         ctx = make_context(security.get_user(state["user_id"]))
         messages, log, errors, pending = [], [], [], None
+        # Batched calls run independently: each one is validated on its own, so a guessed argument (e.g. a
+        # workshop_id not fetched yet) fails with INVALID_INPUT without reaching the backend.
         for call in state["messages"][-1].tool_calls:
             started = time.perf_counter()
-            if call["name"] in state["tools_enabled"]:
+            failed = _failed_before(state["tool_calls"], call)
+            if failed:  # the tool layer already retried it: the model insisting only adds load and latency
+                result = tools.ToolResult(ok=False, error=tools.ToolError(
+                    code=failed["code"], message=f"{failed['message']} Ya se reintentó en esta petición: no insistas, "
+                                                 "informa al usuario."))
+            elif call["name"] in state["tools_enabled"]:
                 result = TOOLS[call["name"]](ctx, **call["args"])
             else:  # never offered to the LLM: role or intent excludes it
                 result = tools.ToolResult(ok=False, error=tools.ToolError(
                     code="FORBIDDEN", message=f"La herramienta {call['name']} no está disponible en esta petición."))
             log.append(_call_log(call["name"], call["args"], result, started))
-            if result.error:
+            if result.error and not failed:  # a repeated call is logged, not counted as a new failure
                 errors.append({"tool": call["name"], **result.error.model_dump()})
             if call["name"] == "propose_action" and result.ok:
                 pending = result.data.model_dump(mode="json")
@@ -175,6 +186,8 @@ def build_graph(
                          "antes de volver a pedirla (si ya consta, la nueva propuesta te avisará del duplicado).")
         elif decision in ANSWERS:
             text = ANSWERS[decision]
+            if decision in ("step_limit", "llm_unavailable") and state["errors"]:  # never hide what went wrong
+                text += f" Último error: {state['errors'][-1]['message']}"
         else:  # the LLM's own answer: second guardrail before it reaches the user
             reply = state["messages"][-1]
             out = judge.screen_output(reply.content)
@@ -229,6 +242,15 @@ def _call_log(name: str, args: dict, result: tools.ToolResult, started: float) -
     # Tool outputs are PII-free by construction (tools.*View), so logging them whole is safe.
     return {"name": name, "args": args, "result": result.model_dump(mode="json"),
             "latency_ms": round((time.perf_counter() - started) * 1000)}
+
+
+def _failed_before(log: list[dict], call: dict) -> dict | None:
+    """The error of an identical call that already failed transiently in this turn, if any."""
+    for c in log:
+        error = c["result"]["error"]
+        if c["name"] == call["name"] and c["args"] == call["args"] and error and error["retryable"]:
+            return error
+    return None
 
 
 def _judge_error(source: str) -> list[dict]:
@@ -325,6 +347,7 @@ def _traced(graph, config, kind: str, user_id: str, user_request: str, run: Call
             "route": values.get("route"),
             "tools_enabled": values.get("tools_enabled"),
             "llm_model": values.get("llm_model"),
+            "prompt_version": values.get("prompt_version"),
             "llm_steps": values.get("steps"),
             "tools_called": [c["name"] for c in calls],
             "tool_parameters": [c["args"] for c in calls],
