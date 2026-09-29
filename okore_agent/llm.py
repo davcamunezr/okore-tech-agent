@@ -12,6 +12,7 @@ from okore_agent.tools import DOCUMENT_LABELS
 
 _CLAIM_ID = re.compile(r"EXP-\d{5}")
 _WANTS_REQUEST = re.compile(r"solicit|recl[aá]m|\bpide\b|p[ií]de(le|selo)|\bpedir\b|env[ií]a|\bmanda", re.I)
+_WANTS_HISTORY = re.compile(r"esperando|pendiente|hist[oó]ric|historial|eventos|qu[eé] ha pasado|[uú]ltimos? cambios", re.I)
 
 
 class ScriptedLLM(BaseChatModel):
@@ -61,14 +62,16 @@ class ScriptedLLM(BaseChatModel):
 
         if "get_workshop" not in results:
             return _call("get_workshop", workshop_id=claim["workshop_id"])
-        return AIMessage(_summary(claim, results["get_workshop"]))
+        if _WANTS_HISTORY.search(request) and "get_claim_events" not in results and self._may_call("get_claim_events"):
+            return _call("get_claim_events", claim_id=claim_id, limit=3)
+        return AIMessage(_summary(claim, results["get_workshop"], results.get("get_claim_events")))
 
 
 def _call(name: str, **args) -> AIMessage:
     return AIMessage("", tool_calls=[{"name": name, "args": args, "id": f"call_{uuid.uuid4().hex[:8]}"}])
 
 
-def _summary(claim: dict, workshop: dict) -> str:
+def _summary(claim: dict, workshop: dict, events: dict | None = None) -> str:
     vehicle = claim["vehicle"]
     missing = ", ".join(DOCUMENT_LABELS.get(d, d) for d in claim["missing_documents"]) or "ninguno"
     if workshop["ok"]:
@@ -76,8 +79,14 @@ def _summary(claim: dict, workshop: dict) -> str:
         shop = f"{w['workshop_id']} ({w['name']}, {w['status']})"
     else:
         shop = f"{claim['workshop_id']}, pero no he podido obtener sus datos: {workshop['error']['message']}"
-    return (
+    text = (
         f"El expediente {claim['claim_id']} está en estado {claim['status']} "
         f"({vehicle['brand']} {vehicle['model']}, {vehicle['plate']}). Documentos pendientes: {missing}. "
         f"Taller asignado: {shop}. Última actualización: {claim['last_update']}."
     )
+    if events is None:
+        return text
+    if not events["ok"]:
+        return f"{text} No he podido consultar el histórico: {events['error']['message']}"
+    recent = "; ".join(f"{e['event_date'][:10]} {e['description']}" for e in events["data"]) or "sin eventos"
+    return f"{text} Últimos eventos: {recent}"
