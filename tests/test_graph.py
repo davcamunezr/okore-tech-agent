@@ -156,7 +156,8 @@ def test_misrouted_request_with_rogue_llm_still_cannot_propose(user, backend):
     ask, _, state = agent(judge=FixedJudge("claim_info"), llm=ScriptedLLM(obey_binding=False))
     reply = ask(user, "Solicita la foto de matrícula de EXP-10234")
     assert not reply.awaiting_confirmation and backend == []
-    assert {"name": "propose_action", "error": "FORBIDDEN"}.items() <= state()["tool_calls"][1].items()
+    call = state()["tool_calls"][1]
+    assert call["name"] == "propose_action" and call["result"]["error"]["code"] == "FORBIDDEN"
 
 
 def test_uncertain_intent_gets_read_tools_only():

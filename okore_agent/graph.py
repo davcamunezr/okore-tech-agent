@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Annotated, TypedDict
 
 from langchain_core.language_models import BaseChatModel
@@ -22,7 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
 
-from okore_agent import security, tools
+from okore_agent import security, tools, trace
 from okore_agent.judge import Judge
 from okore_agent.tools import DOCUMENT_LABELS, TOOLS, PendingAction, ToolContext
 
@@ -44,6 +45,8 @@ ANSWERS = {
     "cancelled": "Acción cancelada: no se ha enviado nada al taller.",
     "step_limit": "No he llegado a una respuesta en el número de pasos permitido. Prueba con una petición más concreta.",
     "withheld": "He retenido la respuesta porque no ha superado los controles de salida. Queda registrada.",
+    "llm_unavailable": "El modelo de lenguaje no responde ahora mismo, así que no he hecho nada. "
+                       "Inténtalo de nuevo en unos minutos.",
 }
 
 
@@ -56,7 +59,8 @@ class AgentState(TypedDict, total=False):
     route: str
     suspicious: bool
     tools_enabled: list[str]
-    tool_calls: list[dict]  # name, args, ok, error code, latency
+    llm_model: str
+    tool_calls: list[dict]  # name, args, result, latency
     errors: list[dict]
     pending_action: dict | None
     action_result: dict | None
@@ -77,6 +81,7 @@ def build_graph(
             "request_id": str(uuid.uuid4()), "judgment": {}, "output_judgment": None, "route": "", "suspicious": False,
             "tools_enabled": [], "tool_calls": [], "errors": [], "pending_action": None, "action_result": None,
             "final_decision": "", "answer": "", "steps": 0,
+            "llm_model": getattr(llm, "model_name", None) or llm._llm_type,
         }
         try:
             security.get_user(state["user_id"])
@@ -95,12 +100,18 @@ def build_graph(
             "suspicious": j.injection >= INJECTION_REVIEW or route == "bulk_data",
             "tools_enabled": sorted(enabled),
             "final_decision": "" if route == "agent" else route,
+            "errors": state["errors"] + _judge_error(j.source),
         }
 
     def agent(state: AgentState) -> dict:
         bound = llm.bind_tools([_tool_spec(name) for name in state["tools_enabled"]])
-        reply = bound.invoke(state["messages"])
         steps = state["steps"] + 1
+        try:
+            reply = bound.invoke(state["messages"])
+        except Exception as exc:  # external model boundary: down, timeout, malformed output. Nothing was done.
+            return {"steps": steps, "final_decision": "llm_unavailable", "errors": state["errors"] + [{
+                "tool": "llm", "code": "UPSTREAM_ERROR", "message": f"{type(exc).__name__}: {exc}"[:300],
+                "retryable": True}]}
         if reply.tool_calls and steps >= MAX_STEPS:
             return {"messages": [reply], "steps": steps, "final_decision": "step_limit"}
         return {"messages": [reply], "steps": steps}
@@ -115,11 +126,7 @@ def build_graph(
             else:  # never offered to the LLM: role or intent excludes it
                 result = tools.ToolResult(ok=False, error=tools.ToolError(
                     code="FORBIDDEN", message=f"La herramienta {call['name']} no está disponible en esta petición."))
-            log.append({
-                "name": call["name"], "args": call["args"], "ok": result.ok,
-                "error": result.error.code if result.error else None,
-                "latency_ms": round((time.perf_counter() - started) * 1000),
-            })
+            log.append(_call_log(call["name"], call["args"], result, started))
             if result.error:
                 errors.append({"tool": call["name"], **result.error.model_dump()})
             if call["name"] == "propose_action" and result.ok:
@@ -144,9 +151,12 @@ def build_graph(
 
     def execute(state: AgentState) -> dict:
         ctx = make_context(security.get_user(state["user_id"]))
+        started = time.perf_counter()
         result = tools.execute_action(ctx, PendingAction.model_validate(state["pending_action"]))
+        args = {"pending_action_id": state["pending_action"]["pending_action_id"]}
         return {
             "action_result": result.model_dump(mode="json"),
+            "tool_calls": state["tool_calls"] + [_call_log("execute_action", args, result, started)],
             "final_decision": "executed" if result.ok else "execution_failed",
             "errors": state["errors"] + ([{"tool": "execute_action", **result.error.model_dump()}] if result.error else []),
         }
@@ -158,19 +168,25 @@ def build_graph(
             text = (f"Hecho: se ha solicitado {DOCUMENT_LABELS[pending['document']]} al taller "
                     f"{pending['workshop_id']} ({pending['workshop_name']}) para el expediente {pending['claim_id']}.")
         elif decision == "execution_failed":
-            text = f"No se ha podido ejecutar la acción: {state['action_result']['error']['message']}"
+            error = state["action_result"]["error"]
+            text = f"No se ha podido ejecutar la acción: {error['message']}"
+            if error["retryable"]:  # timeout/5xx: the backend may have registered it and the response got lost
+                text += (" No puedo asegurar si el backend llegó a registrarla: revisa el histórico del expediente "
+                         "antes de volver a pedirla (si ya consta, la nueva propuesta te avisará del duplicado).")
         elif decision in ANSWERS:
             text = ANSWERS[decision]
         else:  # the LLM's own answer: second guardrail before it reaches the user
             reply = state["messages"][-1]
             out = judge.screen_output(reply.content)
+            errors = state["errors"] + _judge_error(out.source)
             if max(out.claims_done, out.personal_data) >= OUTPUT_BLOCK:
                 return {
                     "messages": [AIMessage(ANSWERS["withheld"], id=reply.id)],  # same id: replaces the LLM's text
                     "answer": ANSWERS["withheld"], "final_decision": "withheld", "suspicious": True,
-                    "output_judgment": asdict(out),
+                    "output_judgment": asdict(out), "errors": errors,
                 }
-            return {"answer": reply.content, "final_decision": decision, "output_judgment": asdict(out)}
+            return {"answer": reply.content, "final_decision": decision, "output_judgment": asdict(out),
+                    "errors": errors}
         return {
             "messages": [AIMessage(text)], "answer": text, "final_decision": decision,
             "pending_action": None,  # consumed (executed, failed or cancelled): nothing left to confirm
@@ -184,7 +200,7 @@ def build_graph(
     g.add_conditional_edges("authorize", lambda s: "respond" if s["final_decision"] else "screen")
     g.add_conditional_edges("screen", lambda s: "agent" if s["route"] == "agent" else "respond")
     g.add_conditional_edges(
-        "agent", lambda s: "tools" if s["messages"][-1].tool_calls and not s["final_decision"] else "respond")
+        "agent", lambda s: "tools" if not s["final_decision"] and s["messages"][-1].tool_calls else "respond")
     g.add_conditional_edges(
         "tools", lambda s: "confirm" if s["pending_action"] else "agent")
     g.add_conditional_edges("confirm", lambda s: "execute" if s["final_decision"] == "confirmed" else "respond")
@@ -209,6 +225,19 @@ def _route(j, user: security.User) -> tuple[str, frozenset[str]]:
     return "agent", security.allowed_tools(user) & security.READ_TOOLS
 
 
+def _call_log(name: str, args: dict, result: tools.ToolResult, started: float) -> dict:
+    # Tool outputs are PII-free by construction (tools.*View), so logging them whole is safe.
+    return {"name": name, "args": args, "result": result.model_dump(mode="json"),
+            "latency_ms": round((time.perf_counter() - started) * 1000)}
+
+
+def _judge_error(source: str) -> list[dict]:
+    """Jev fell back to rules: not fatal, but never silent."""
+    if not source.startswith("rules ("):
+        return []
+    return [{"tool": "judge", "code": "UPSTREAM_ERROR", "message": source, "retryable": True}]
+
+
 def _tool_spec(name: str) -> dict:
     fn = TOOLS[name]
     return {"type": "function", "function": {
@@ -226,17 +255,25 @@ class Reply:
 
 def ask(graph, thread_id: str, user_id: str, text: str) -> Reply:
     config = {"configurable": {"thread_id": thread_id}}
-    graph.invoke({"user_id": user_id, "messages": [HumanMessage(text)]}, config)
-    return _reply(graph, config)
+
+    def run() -> Reply:
+        graph.invoke({"user_id": user_id, "messages": [HumanMessage(text)]}, config)
+        return _reply(graph, config)
+
+    return _traced(graph, config, "ask", user_id, text, run)
 
 
 def confirm(graph, thread_id: str, user_id: str, approve: bool) -> Reply:
     """The only way to resume a paused thread. The LLM cannot call this: it is not a tool."""
     config = {"configurable": {"thread_id": thread_id}}
-    if not graph.get_state(config).interrupts:
-        return Reply("No hay ninguna acción pendiente de confirmar.", "no_pending_action")
-    graph.invoke(Command(resume={"confirm": approve, "user_id": user_id}), config)
-    return _reply(graph, config)
+
+    def run() -> Reply:
+        if not graph.get_state(config).interrupts:
+            return Reply("No hay ninguna acción pendiente de confirmar.", "no_pending_action")
+        graph.invoke(Command(resume={"confirm": approve, "user_id": user_id}), config)
+        return _reply(graph, config)
+
+    return _traced(graph, config, "confirm", user_id, f"[confirm approve={approve}]", run)
 
 
 def _reply(graph, config) -> Reply:
@@ -244,4 +281,63 @@ def _reply(graph, config) -> Reply:
     if snapshot.interrupts:
         return Reply(snapshot.interrupts[0].value["text"], "awaiting_confirmation", awaiting_confirmation=True)
     return Reply(snapshot.values["answer"], snapshot.values["final_decision"])
+
+
+def _traced(graph, config, kind: str, user_id: str, user_request: str, run: Callable[[], Reply]) -> Reply:
+    """Runs one ask/confirm and always writes its trace line, including when the run crashes."""
+    before = graph.get_state(config).values
+    # A confirm resumes the ask's turn: its line covers only what happens after the resume.
+    offset = len(before.get("tool_calls", [])) if kind == "confirm" else 0
+    pending_before = before.get("pending_action") if kind == "confirm" else None
+    started = time.perf_counter()
+    reply, crash = None, None
+    try:
+        reply = run()
+        return reply
+    except Exception as exc:
+        crash = exc
+        raise
+    finally:
+        values = graph.get_state(config).values
+        if reply and reply.decision == "no_pending_action":
+            values, offset = {}, 0
+        calls = values.get("tool_calls", [])[offset:]
+        pending = pending_before or (values.get("pending_action") if reply and reply.awaiting_confirmation else None)
+        judgment = values.get("judgment") or {}
+        user = security.USERS.get(user_id)
+        attempted = kind == "confirm" and values.get("final_decision") in ("executed", "execution_failed")
+        errors = values.get("errors", []) + (
+            [{"tool": "agent", "code": "INTERNAL_ERROR", "message": repr(crash)[:300], "retryable": False}]
+            if crash else [])
+        trace.write({
+            "request_id": values.get("request_id"),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "kind": kind,
+            "thread_id": config["configurable"]["thread_id"],
+            "user_id": user_id,
+            "role": user.role if user else None,
+            "user_request": user_request,
+            "detected_intent": judgment.get("intent"),
+            "intent_confidence": judgment.get("confidence"),
+            "injection": judgment.get("injection"),
+            "judge_source": judgment.get("source"),
+            "suspicious": values.get("suspicious", False),
+            "route": values.get("route"),
+            "tools_enabled": values.get("tools_enabled"),
+            "llm_model": values.get("llm_model"),
+            "llm_steps": values.get("steps"),
+            "tools_called": [c["name"] for c in calls],
+            "tool_parameters": [c["args"] for c in calls],
+            "tool_results": [{**c["result"], "latency_ms": c["latency_ms"]} for c in calls],
+            "final_decision": reply.decision if reply else "error",
+            "answer": reply.answer if reply else None,
+            "output_judgment": values.get("output_judgment"),
+            "action_requested": pending,
+            "pending_action_id": pending and pending["pending_action_id"],
+            "idempotency_key": pending["pending_action_id"] if attempted else None,
+            "action_executed": kind == "confirm" and values.get("final_decision") == "executed",
+            "action_result": values.get("action_result") if kind == "confirm" else None,
+            "errors": errors,
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+        })
 
