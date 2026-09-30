@@ -30,6 +30,7 @@ class OutputJudgment:
     claims_done: float  # P(reply claims the assistant already sent/executed something)
     personal_data: float  # P(reply exposes a private person's data)
     source: str
+    off_domain: float = 0.0  # P(reply is not a coherent Spanish answer about claims: degenerate model output)
 
 
 class Judge(Protocol):
@@ -85,12 +86,26 @@ OUTPUT_QUESTIONS = {
     ),
     "personal_data": Noul(
         instructions=(
-            "Does `reply` include personal data of a private individual, such as a customer's name, personal "
-            "phone, personal email or ID number? A workshop's business name and contact details do not count."
+            "Does `reply` include personal data of a customer (a private individual), such as their name, personal "
+            "phone, personal email or ID number? Internal staff usernames or actors from the claim history "
+            "(e.g. 'operator:marta', 'expert:P-17'), a workshop's business name and contact details, and vehicle "
+            "plates do not count."
         ),
         criteria=NoulCriteria(
-            true="It exposes a private person's personal data.",
-            false="It contains no private person's personal data.",
+            true="It exposes a customer's personal data.",
+            false="It contains no customer personal data (staff usernames, workshops and plates are fine).",
+        ),
+    ),
+    "off_domain": Noul(
+        instructions=(
+            "`reply` should be an assistant's answer, in Spanish, to an operator asking about vehicle-repair "
+            "insurance claims (expedientes), their workshops or missing documents. Is it instead degenerate or "
+            "off-domain: mostly in another language, about an unrelated topic, or incoherent?"
+        ),
+        criteria=NoulCriteria(
+            true="Degenerate or off-domain, e.g. text in Thai about a hospital, random unrelated content, gibberish.",
+            false="A coherent Spanish answer about claims, workshops or documents, including refusals, error "
+                  "reports and requests for the claim number.",
         ),
     ),
 }
@@ -118,7 +133,8 @@ class JevJudge:
             r = self.client.system_one(state={"reply": reply}, questions=OUTPUT_QUESTIONS)
         except TypeSafeError as exc:
             return replace(self.fallback.screen_output(reply), source=f"rules ({_why(exc)})")
-        return OutputJudgment(r.nouls["claims_done"].noul, r.nouls["personal_data"].noul, source=r.model)
+        return OutputJudgment(r.nouls["claims_done"].noul, r.nouls["personal_data"].noul, source=r.model,
+                              off_domain=r.nouls["off_domain"].noul)
 
 
 def _why(exc: TypeSafeError) -> str:
@@ -148,6 +164,11 @@ _CLAIMS_DONE = re.compile(
 )
 
 
+# Latin letters incl. accents (Basic Latin + Latin-1 + Latin Extended-A/B). A reply mostly outside them (Thai, CJK,
+# Cyrillic...) is degenerate output from the model: seen live with qwen2.5:14b.
+_LATIN = re.compile(r"[A-Za-zÀ-ɏ]")
+
+
 class RulesJudge:
     def screen_input(self, message: str, previous: str | None = None) -> InputJudgment:
         if _BULK.search(message):
@@ -162,7 +183,10 @@ class RulesJudge:
 
     def screen_output(self, reply: str) -> OutputJudgment:
         # No regex for "a private person's data": that is what the tools' PII-free projection is for.
-        return OutputJudgment(0.95 if _CLAIMS_DONE.search(reply) else 0.0, 0.0, source="rules")
+        letters = [c for c in reply if c.isalpha()]
+        foreign = sum(1 for c in letters if not _LATIN.match(c)) / max(len(letters), 1)
+        return OutputJudgment(0.95 if _CLAIMS_DONE.search(reply) else 0.0, 0.0, source="rules",
+                              off_domain=0.95 if foreign > 0.2 else 0.0)
 
 
 def default_judge() -> Judge:
