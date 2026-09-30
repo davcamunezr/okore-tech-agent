@@ -31,9 +31,10 @@ def make_context(user):
 class FixedJudge(RulesJudge):
     """Forces a judgment, e.g. a misclassification, to test what stands behind the router."""
 
-    def __init__(self, intent="claim_info", confidence=1.0, injection=0.0, claims_done=0.0, personal_data=0.0):
+    def __init__(self, intent="claim_info", confidence=1.0, injection=0.0, claims_done=0.0, personal_data=0.0,
+                 off_domain=0.0):
         self.judgment = InputJudgment(intent, confidence, injection, source="fixed")
-        self.output = OutputJudgment(claims_done, personal_data, source="fixed")
+        self.output = OutputJudgment(claims_done, personal_data, source="fixed", off_domain=off_domain)
 
     def screen_input(self, message, previous=None):
         return self.judgment
@@ -175,7 +176,7 @@ def test_suspicious_but_not_blocked_proceeds_read_only():
 
 # --- Output guardrail ---
 
-@pytest.mark.parametrize("flags", [{"claims_done": 0.9}, {"personal_data": 0.9}])
+@pytest.mark.parametrize("flags", [{"claims_done": 0.9}, {"personal_data": 0.9}, {"off_domain": 0.9}])
 def test_output_guardrail_withholds_flagged_answers(flags):
     ask, _, state = agent(judge=FixedJudge(**flags))
     reply = ask("luis", "¿Estado de EXP-10234?")
@@ -189,6 +190,16 @@ def test_output_guardrail_withholds_flagged_answers(flags):
 ])
 def test_rules_output_guard_catches_invented_execution(text):
     assert RulesJudge().screen_output(text).claims_done >= agent_graph.OUTPUT_BLOCK
+
+
+@pytest.mark.parametrize("text, flagged", [
+    # qwen2.5:14b, live through the web UI:
+    ("โรงพยาบาลดีที่สุดในการให้บริการด้านสุขภาพ กรุณาแจ้งหมายเลขประจำเรื่อง (EXP-XXXXX)", True),
+    ("El expediente EXP-10234 está en estado REPAIRING. Falta la fotografía de matrícula (PHOTO_PLATE).", False),
+    ("Indícame el número de expediente (formato EXP-12345), por favor.", False),
+])
+def test_rules_output_guard_catches_degenerate_script(text, flagged):
+    assert (RulesJudge().screen_output(text).off_domain >= agent_graph.OUTPUT_BLOCK) == flagged
 
 
 def test_rules_output_guard_lets_history_through():

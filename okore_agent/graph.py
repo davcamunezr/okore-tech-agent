@@ -192,7 +192,7 @@ def build_graph(
             reply = state["messages"][-1]
             out = judge.screen_output(reply.content)
             errors = state["errors"] + _judge_error(out.source)
-            if max(out.claims_done, out.personal_data) >= OUTPUT_BLOCK:
+            if max(out.claims_done, out.personal_data, out.off_domain) >= OUTPUT_BLOCK:
                 return {
                     "messages": [AIMessage(ANSWERS["withheld"], id=reply.id)],  # same id: replaces the LLM's text
                     "answer": ANSWERS["withheld"], "final_decision": "withheld", "suspicious": True,

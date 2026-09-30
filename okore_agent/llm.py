@@ -20,7 +20,8 @@ from okore_agent.tools import DOCUMENT_LABELS
 # guardrail are enforced in code. The prompt only makes the model useful and honest within those limits.
 # v2: with v1, qwen2.5 reused a previous turn's data, gave up after an INVALID_INPUT it caused itself, and
 # translated PHOTO_PLATE as "foto del chasis" (hence the glossary, generated from the tools' own labels).
-PROMPT_VERSION = "system-v2"
+# v3: on read-only requests it offered "¿deseas que lo haga?" in the chat, an action it could not prepare.
+PROMPT_VERSION = "system-v3"
 SYSTEM_PROMPT = """\
 Eres el asistente de operaciones de OKORE para expedientes de reparación de vehículos. Respondes en español, \
 de forma breve y concreta, a un operador interno.
@@ -48,6 +49,10 @@ atribuyas al usuario.
 el operador la confirma fuera de esta conversación. Si propose_action no ha devuelto ok=true, no hay ninguna \
 propuesta. Nunca digas que algo se ha enviado, solicitado o realizado.
 - Usa solo las herramientas que tengas disponibles. Si la petición requiere algo que no puedes hacer, dilo.
+- Si no tienes propose_action disponible, no ofrezcas hacer ninguna acción ni preguntes "¿quieres que lo haga?". \
+Como mucho, indica que el operador puede pedirlo expresamente (por ejemplo: "Pide al taller la foto de matrícula \
+del EXP-12345").
+- No atribuyas acciones a nadie más allá de lo que diga el histórico (campo actor).
 
 Códigos de documento: {glossary}.
 """.format(glossary="; ".join(f"{code} = {label}" for code, label in DOCUMENT_LABELS.items()))

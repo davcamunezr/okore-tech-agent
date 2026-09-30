@@ -28,14 +28,13 @@ services:
       postgres:
         condition: service_healthy
 
-  # Interactive CLI, not a daemon: docker compose run --rm agent --user luis
-  agent:
+  # Web UI + HTTP API: http://localhost:8000
+  web:
     build: .
-    profiles: ["cli"]
-    entrypoint: ["python", "-m", "okore_agent.cli"]
-    stdin_open: true
-    tty: true
-    environment:
+    command: uvicorn okore_agent.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment: &agent-env
       MOCKS_URL: http://mocks:8001
       AGENT_DB_URL: postgresql://agent_ro:agent_ro@postgres:5432/${POSTGRES_DB:-okore}
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
@@ -45,15 +44,27 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-not-needed}
       TYPESAFE_API_KEY: ${TYPESAFE_API_KEY:-}
       TRACE_PATH: /app/logs/agent_runs.jsonl
-    extra_hosts:
+    extra_hosts: &host-gateway
       - "host.docker.internal:host-gateway"
-    volumes:
+    volumes: &logs
       - ./logs:/app/logs
-    depends_on:
+    depends_on: &agent-deps
       postgres:
         condition: service_healthy
       mocks:
         condition: service_started
+
+  # Interactive CLI, not a daemon: docker compose run --rm agent --user luis
+  agent:
+    build: .
+    profiles: ["cli"]
+    entrypoint: ["python", "-m", "okore_agent.cli"]
+    stdin_open: true
+    tty: true
+    environment: *agent-env
+    extra_hosts: *host-gateway
+    volumes: *logs
+    depends_on: *agent-deps
 
 volumes:
   pgdata:
